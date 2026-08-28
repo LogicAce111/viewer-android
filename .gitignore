@@ -1,0 +1,14 @@
+.gradle/
+.idea/
+.kotlin/
+.discarded-resources/
+local.properties
+keystore.properties
+*.jks
+*.keystore
+build/
+app/build/
+artifacts/
+captures/
+*.iml
+*.log
