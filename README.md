@@ -2,7 +2,7 @@
 
 Viewer 是一个目录驱动、完全本地的 Android 全媒体播放器。用户分别指定视频、音乐、文本和漫画目录，应用只读取所选目录，并按分类独立过滤文件。
 
-Windows 版本请访问 [logicace/viewer-windows](https://github.com/logicace/viewer-windows)。
+Windows 版本请访问 [LogicAce111/viewer-windows](https://github.com/LogicAce111/viewer-windows)。
 
 ## 发布信息
 
