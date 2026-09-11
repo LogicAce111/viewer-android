@@ -26,13 +26,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -43,9 +43,11 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -57,6 +59,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -104,17 +107,69 @@ fun TextReaderScreen(model: ViewerViewModel, item: MediaItem, onBack: () -> Unit
     val currentRatio = remember(item.uri) { mutableFloatStateOf(0f) }
     var restoredRatio by remember { mutableFloatStateOf(0f) }
     var progressReady by remember(item.uri) { mutableStateOf(false) }
-    var controlsVisible by remember(item.uri) { mutableStateOf(true) }
+    var contentReady by remember(item.uri) { mutableStateOf(false) }
+    val chrome = rememberReaderChrome(item.uri, contentReady && error == null)
+    val tools = rememberReaderTools(item.uri, chrome)
+    val scope = rememberCoroutineScope()
+    val plainList = rememberLazyListState()
+    val chunks = remember(content) { chunkPlainText(content.orEmpty()) }
+    var hadHistory by remember(item.uri) { mutableStateOf(false) }
+    var initialRestoreChecked by remember(item.uri) { mutableStateOf(false) }
+    var navigating by remember(item.uri) { mutableStateOf(false) }
     val appearance = settings.reader
+    val latestAppearance by rememberUpdatedState(appearance)
+
+    fun textLayoutKey(): Any = latestAppearance to plainList.layoutInfo.viewportSize
+
+    fun returnTop() {
+        if (!contentReady || navigating) return
+        if (item.extension == "md") {
+            val view = webView ?: return
+            if (view.scrollY <= 0) return
+            val y = view.scrollY
+            val ratio = currentRatio.floatValue
+            val layout = Triple(view.width, view.height, view.contentHeight) to latestAppearance
+            view.flingScroll(0, 0)
+            view.scrollTo(0, 0)
+            currentRatio.floatValue = 0f
+            model.saveTextProgress(item, 0f)
+            tools.offerUndo {
+                if (contentReady && webView === view) {
+                    val sameLayout = layout == (Triple(view.width, view.height, view.contentHeight) to latestAppearance)
+                    val range = (view.contentHeight * pageScale(view) - view.height).coerceAtLeast(0f)
+                    view.flingScroll(0, 0)
+                    view.scrollTo(0, if (sameLayout) y else (range * ratio).toInt())
+                    currentRatio.floatValue = if (range > 0) (view.scrollY / range).coerceIn(0f, 1f) else 0f
+                    model.saveTextProgress(item, currentRatio.floatValue)
+                }
+            }
+        } else {
+            if (!plainList.canScrollBackward) return
+            val saved = captureReadingPosition(plainList, chunks.size, textLayoutKey())
+            navigating = true
+            scope.launch {
+                try {
+                    plainList.scrollToItem(0)
+                    currentRatio.floatValue = 0f
+                    model.saveTextProgress(item, 0f)
+                    tools.offerUndo {
+                        restoreReadingPosition(plainList, chunks.size, saved, textLayoutKey())
+                        currentRatio.floatValue = captureReadingPosition(plainList, chunks.size, textLayoutKey()).ratio
+                        model.saveTextProgress(item, currentRatio.floatValue)
+                    }
+                } finally { navigating = false }
+            }
+        }
+    }
 
     LaunchedEffect(item.uri) {
         val saved = model.container.progress.get(item.category, item.uri)
-        restoredRatio = saved?.scrollRatio ?: 0f
+        restoredRatio = saved?.scrollRatio?.takeIf { it.isFinite() && it > 0f && it <= 1f } ?: 0f
+        hadHistory = restoredRatio > 0f
         currentRatio.floatValue = restoredRatio
         runCatching { readText(model, item) }
             .onSuccess {
                 content = it
-                progressReady = true
             }
             .onFailure { error = it.message ?: "无法读取文本" }
     }
@@ -129,7 +184,7 @@ fun TextReaderScreen(model: ViewerViewModel, item: MediaItem, onBack: () -> Unit
 
     DisposableEffect(item.uri, lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) {
+            if (event == Lifecycle.Event.ON_STOP && progressReady) {
                 model.saveTextProgress(item, currentRatio.floatValue)
             }
         }
@@ -137,7 +192,7 @@ fun TextReaderScreen(model: ViewerViewModel, item: MediaItem, onBack: () -> Unit
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
             webView?.destroy()
-            model.saveTextProgress(item, currentRatio.floatValue)
+            if (progressReady) model.saveTextProgress(item, currentRatio.floatValue)
         }
     }
 
@@ -155,13 +210,20 @@ fun TextReaderScreen(model: ViewerViewModel, item: MediaItem, onBack: () -> Unit
         val view = webView
         val html = renderedHtml
         if (view != null && html != null) {
-            restoredRatio = currentRatio.floatValue.takeIf { it > 0f } ?: restoredRatio
+            contentReady = false
+            progressReady = false
+            if (initialRestoreChecked) restoredRatio = currentRatio.floatValue
             view.setBackgroundColor(if (appearance.dark) AndroidColor.rgb(14, 17, 22) else AndroidColor.rgb(250, 248, 242))
             view.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
         }
     }
 
-    Scaffold(
+    ReaderFrame(
+        state = chrome,
+        tools = tools,
+        canReturnTop = contentReady && !navigating && if (item.extension == "md") currentRatio.floatValue > 0f else plainList.canScrollBackward,
+        onReturnTop = ::returnTop,
+        background = if (appearance.dark) Color(0xFF0E1116) else Color(0xFFFAF8F2),
         topBar = {
             TopAppBar(
                 title = {
@@ -175,9 +237,6 @@ fun TextReaderScreen(model: ViewerViewModel, item: MediaItem, onBack: () -> Unit
                 },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(ViewerIcons.Back, "返回") } },
                 actions = {
-                    IconButton(onClick = { controlsVisible = !controlsVisible }) {
-                        Icon(ViewerIcons.Tune, if (controlsVisible) "隐藏阅读设置" else "显示阅读设置")
-                    }
                     IconButton(onClick = { model.setReader(appearance.copy(dark = !appearance.dark)) }) {
                         Icon(if (appearance.dark) ViewerIcons.LightTheme else ViewerIcons.DarkTheme, "阅读主题")
                     }
@@ -185,17 +244,17 @@ fun TextReaderScreen(model: ViewerViewModel, item: MediaItem, onBack: () -> Unit
             )
         },
         bottomBar = {
-            if (controlsVisible) ReaderControls(appearance) { model.setReader(it) }
+            ReaderControls(appearance) { model.setReader(it) }
         },
-    ) { padding ->
+    ) {
         val text = content
         when {
-            error != null -> Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) { Text(error.orEmpty(), color = MaterialTheme.colorScheme.error) }
-            text == null -> Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) { Text("正在打开文本…") }
-            item.extension == "md" -> Box(Modifier.fillMaxSize().padding(padding)) {
+            error != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(error.orEmpty(), color = MaterialTheme.colorScheme.error) }
+            text == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("正在打开文本…") }
+            item.extension == "md" -> Box(Modifier.fillMaxSize()) {
                 AndroidView(
                     factory = { context ->
-                        WebView(context).apply {
+                        ReaderWebView(context, chrome).apply {
                             webView = this
                             setBackgroundColor(if (appearance.dark) AndroidColor.rgb(14, 17, 22) else AndroidColor.rgb(250, 248, 242))
                             this.settings.javaScriptEnabled = false
@@ -212,13 +271,21 @@ fun TextReaderScreen(model: ViewerViewModel, item: MediaItem, onBack: () -> Unit
                                     view.post {
                                         val range = (view.contentHeight * pageScale(view) - view.height).coerceAtLeast(0f)
                                         view.scrollTo(0, (range * restoredRatio).toInt())
+                                        currentRatio.floatValue = if (range > 0) (view.scrollY / range).coerceIn(0f, 1f) else 0f
+                                        contentReady = true
+                                        progressReady = true
+                                        if (!initialRestoreChecked) {
+                                            initialRestoreChecked = true
+                                            if (hadHistory && view.scrollY > 0) tools.showRestored()
+                                        }
                                     }
                                 }
                             }
                             setOnScrollChangeListener { view, _, scrollY, _, _ ->
                                 val target = view as WebView
                                 val range = (target.contentHeight * pageScale(target) - target.height).coerceAtLeast(1f)
-                                currentRatio.floatValue = (scrollY / range).coerceIn(0f, 1f)
+                                if (contentReady) currentRatio.floatValue = (scrollY / range).coerceIn(0f, 1f)
+                                chrome.interact()
                             }
                         }
                     },
@@ -239,10 +306,21 @@ fun TextReaderScreen(model: ViewerViewModel, item: MediaItem, onBack: () -> Unit
             }
             else -> PlainTextContent(
                 content = text,
+                chunks = chunks,
+                listState = plainList,
                 appearance = appearance,
                 restoredRatio = restoredRatio,
                 onRatioChange = { currentRatio.floatValue = it },
-                modifier = Modifier.fillMaxSize().padding(padding),
+                onReady = {
+                    contentReady = true
+                    progressReady = true
+                    if (!initialRestoreChecked) {
+                        initialRestoreChecked = true
+                        if (hadHistory && plainList.canScrollBackward) tools.showRestored()
+                    }
+                },
+                onInteraction = chrome::interact,
+                modifier = Modifier.fillMaxSize().readerContentTap(chrome),
             )
         }
     }
@@ -251,13 +329,15 @@ fun TextReaderScreen(model: ViewerViewModel, item: MediaItem, onBack: () -> Unit
 @Composable
 private fun PlainTextContent(
     content: String,
+    chunks: List<TextChunk>,
+    listState: LazyListState,
     appearance: ReaderAppearance,
     restoredRatio: Float,
     onRatioChange: (Float) -> Unit,
+    onReady: () -> Unit,
+    onInteraction: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val chunks = remember(content) { chunkPlainText(content) }
-    val listState = rememberLazyListState()
     var restored by remember(content) { mutableStateOf(false) }
     var scrollRatio by remember(content) { mutableFloatStateOf(restoredRatio) }
     var requestedRatio by remember(content) { mutableFloatStateOf(-1f) }
@@ -276,6 +356,7 @@ private fun PlainTextContent(
             }
             scrollRatio = restoredRatio.coerceIn(0f, 1f)
             restored = true
+            onReady()
         }
     }
     LaunchedEffect(requestedRatio) {
@@ -288,6 +369,7 @@ private fun PlainTextContent(
         if (itemSize > 0 && fraction > 0f) {
             listState.scrollToItem(index, (itemSize * fraction).toInt())
         }
+        requestedRatio = -1f
     }
     LaunchedEffect(listState, chunks.size, restored) {
         if (!restored || chunks.isEmpty()) return@LaunchedEffect
@@ -305,6 +387,7 @@ private fun PlainTextContent(
             .collectLatest {
                 scrollRatio = it
                 onRatioChange(it)
+                onInteraction()
             }
     }
 
@@ -478,8 +561,9 @@ fun ComicReaderScreen(model: ViewerViewModel, work: ComicWork, onBack: () -> Uni
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val imageLoader = context.imageLoader
-    val targetWidthPx = context.resources.displayMetrics.widthPixels.coerceAtLeast(1)
+    val targetWidthPx = LocalResources.current.displayMetrics.widthPixels.coerceAtLeast(1)
     val currentPage by remember(listState, work.pages.size) {
         derivedStateOf {
             val layout = listState.layoutInfo
@@ -493,7 +577,46 @@ fun ComicReaderScreen(model: ViewerViewModel, work: ComicWork, onBack: () -> Uni
     }
     var restored by remember(work.relativePath) { mutableStateOf(false) }
     var comicWidthDraft by remember(work.relativePath) { mutableFloatStateOf(settings.comicWidth) }
-    var controlsVisible by remember(work.relativePath) { mutableStateOf(true) }
+    val pageLoads = remember(work.relativePath) { mutableStateMapOf<Int, Boolean>() }
+    val pageRatios = remember(work.relativePath) { mutableStateMapOf<Int, Float>() }
+    var historyRestored by remember(work.relativePath) { mutableStateOf(false) }
+    var navigating by remember(work.relativePath) { mutableStateOf(false) }
+    var initialContentReady by remember(work.relativePath) { mutableStateOf(false) }
+    LaunchedEffect(restored, currentPage, pageLoads[currentPage]) {
+        if (restored && pageLoads[currentPage] == true) initialContentReady = true
+    }
+    // Loading subsequent pages during scrolling must not reveal hidden controls.
+    val chrome = rememberReaderChrome(work.relativePath, initialContentReady && pageLoads[currentPage] != false)
+    val tools = rememberReaderTools(work.relativePath, chrome)
+
+    LaunchedEffect(initialContentReady, historyRestored) {
+        if (initialContentReady && historyRestored) tools.showRestored()
+    }
+
+    fun comicLayoutKey(): Any = comicWidthDraft to listState.layoutInfo.viewportSize
+    fun savePosition() {
+        if (restored) model.saveComicProgress(work, listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
+    }
+    fun returnTop() {
+        if (!chrome.ready || navigating || !listState.canScrollBackward) return
+        val saved = captureReadingPosition(listState, work.pages.size, comicLayoutKey())
+        navigating = true
+        scope.launch {
+            try {
+                listState.scrollToItem(0)
+                savePosition()
+                tools.offerUndo {
+                    restoreReadingPosition(listState, work.pages.size, saved, comicLayoutKey())
+                    savePosition()
+                }
+            } finally { navigating = false }
+        }
+    }
+
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+            .collectLatest { chrome.interact() }
+    }
 
     LaunchedEffect(settings.comicWidth) { comicWidthDraft = settings.comicWidth }
 
@@ -501,6 +624,7 @@ fun ComicReaderScreen(model: ViewerViewModel, work: ComicWork, onBack: () -> Uni
         val saved = model.container.progress.get(work.cover.category, work.cover.uri)
         if (saved != null && saved.pageIndex in work.pages.indices) {
             listState.scrollToItem(saved.pageIndex, saved.pageOffset)
+            historyRestored = (saved.pageIndex > 0 || saved.pageOffset > 0) && listState.canScrollBackward
         }
         restored = true
     }
@@ -536,20 +660,23 @@ fun ComicReaderScreen(model: ViewerViewModel, work: ComicWork, onBack: () -> Uni
                 }
             }
     }
-    DisposableEffect(work.relativePath) {
+    DisposableEffect(work.relativePath, lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) savePosition()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
-            scope.launch {
-                model.container.progress.saveComic(
-                    work.cover,
-                    listState.firstVisibleItemIndex.coerceIn(work.pages.indices),
-                    listState.firstVisibleItemScrollOffset,
-                )
-            }
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            savePosition()
         }
     }
 
-    Scaffold(
-        containerColor = Color(0xFF080A0E),
+    ReaderFrame(
+        state = chrome,
+        tools = tools,
+        canReturnTop = chrome.ready && !navigating && listState.canScrollBackward,
+        onReturnTop = ::returnTop,
+        background = Color(0xFF080A0E),
         topBar = {
             TopAppBar(
                 title = {
@@ -559,39 +686,32 @@ fun ComicReaderScreen(model: ViewerViewModel, work: ComicWork, onBack: () -> Uni
                     }
                 },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(ViewerIcons.Back, "返回") } },
-                actions = {
-                    IconButton(onClick = { controlsVisible = !controlsVisible }) {
-                        Icon(ViewerIcons.Tune, if (controlsVisible) "隐藏漫画设置" else "显示漫画设置")
-                    }
-                },
             )
         },
         bottomBar = {
-            if (controlsVisible) {
-                Surface(shadowElevation = 6.dp) {
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("宽度")
-                        ViewerSlider(
-                            value = comicWidthDraft,
-                            onValueChange = { comicWidthDraft = it },
-                            onValueChangeFinished = { model.setComicWidth(comicWidthDraft) },
-                            valueRange = .6f..1f,
-                            modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
-                        )
-                        Text("${(comicWidthDraft * 100).toInt()}%")
-                    }
+            Surface(shadowElevation = 6.dp) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("宽度")
+                    ViewerSlider(
+                        value = comicWidthDraft,
+                        onValueChange = { comicWidthDraft = it },
+                        onValueChangeFinished = { model.setComicWidth(comicWidthDraft) },
+                        valueRange = .6f..1f,
+                        modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
+                    )
+                    Text("${(comicWidthDraft * 100).toInt()}%")
                 }
             }
         },
-    ) { padding ->
+    ) {
         LazyColumn(
             state = listState,
-            modifier = Modifier.fillMaxSize().padding(padding).background(Color(0xFF080A0E)),
+            modifier = Modifier.fillMaxSize().readerContentTap(chrome).background(Color(0xFF080A0E)),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             work.pages.forEachIndexed { index, page ->
                 item(key = page.uri.toString()) {
-                    var pageAspectRatio by remember(page.uri) { mutableFloatStateOf(DEFAULT_COMIC_PAGE_RATIO) }
+                    val pageAspectRatio = pageRatios[index] ?: DEFAULT_COMIC_PAGE_RATIO
                     val pageRequest = remember(page.uri, targetWidthPx) {
                         comicImageRequest(context, page, targetWidthPx)
                     }
@@ -604,13 +724,18 @@ fun ComicReaderScreen(model: ViewerViewModel, work: ComicWork, onBack: () -> Uni
                                 .aspectRatio(pageAspectRatio),
                             contentScale = ContentScale.FillWidth,
                             onSuccess = { state ->
+                                pageLoads[index] = true
                                 val width = state.result.image.width
                                 val height = state.result.image.height
                                 if (width > 0 && height > 0) {
-                                    pageAspectRatio = width.toFloat() / height.toFloat()
+                                    pageRatios[index] = width.toFloat() / height.toFloat()
                                 }
                             },
+                            onError = { pageLoads[index] = false },
                         )
+                        if (pageLoads[index] == false) {
+                            Text("无法读取第 ${index + 1} 页", color = Color.White)
+                        }
                     }
                 }
             }

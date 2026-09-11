@@ -85,6 +85,8 @@ import com.legion.viewer.model.ScanResult
 import com.legion.viewer.ViewerApplication
 import com.legion.viewer.R
 import com.legion.viewer.data.MediaNaturalComparator
+import com.legion.viewer.data.buildComicWorks
+import com.legion.viewer.data.groupComicWorks
 
 private data class NavItem(val title: String, val icon: ImageVector, val target: ViewerScreen)
 
@@ -423,7 +425,12 @@ private fun CategoryScreen(
         is ScanResult.Loading -> {
             val previous = result.previous
             if (previous == null) {
-                EmptyState(ViewerIcons.Refresh, "正在读取目录", "已检查 ${result.progress.checkedFiles} 个文件", null, null, loading = true)
+                EmptyState(
+                    ViewerIcons.Refresh,
+                    if (result.fromIndex) "正在载入已保存的内容" else "正在读取目录",
+                    if (result.fromIndex) "" else "已检查 ${result.progress.checkedFiles} 个文件",
+                    null, null, loading = true,
+                )
             } else {
                 Box(Modifier.fillMaxSize()) {
                     CategoryContent(category, previous, onMedia, onComic)
@@ -435,7 +442,7 @@ private fun CategoryScreen(
                         Column {
                             LinearProgressIndicator(Modifier.fillMaxWidth())
                             Text(
-                                "正在刷新 · 已检查 ${result.progress.checkedFiles} 个文件",
+                                if (result.fromIndex) "正在载入已保存的内容" else "正在刷新 · 已检查 ${result.progress.checkedFiles} 个文件",
                                 Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
                                 style = MaterialTheme.typography.labelMedium,
                             )
@@ -444,7 +451,29 @@ private fun CategoryScreen(
                 }
             }
         }
-        is ScanResult.Failure -> EmptyState(ViewerIcons.BrokenImage, "目录读取失败", result.message, "重新选择", onChoose)
+        is ScanResult.Failure -> {
+            val previous = result.previous
+            if (previous == null) {
+                Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(Modifier.weight(1f)) {
+                        EmptyState(ViewerIcons.BrokenImage, "内容载入失败", result.message, "刷新", onRefresh)
+                    }
+                    TextButton(onClick = onChoose, modifier = Modifier.padding(bottom = 16.dp)) { Text("重新选择目录") }
+                }
+            } else {
+                Column(Modifier.fillMaxSize()) {
+                    Surface(color = MaterialTheme.colorScheme.errorContainer) {
+                        Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(result.message, Modifier.weight(1f).padding(vertical = 8.dp), style = MaterialTheme.typography.bodySmall)
+                            TextButton(onClick = onRefresh) { Text("刷新") }
+                        }
+                    }
+                    Box(Modifier.weight(1f)) {
+                        CategoryScreen(category, previous, onChoose, onRefresh, onMedia, onComic)
+                    }
+                }
+            }
+        }
         is ScanResult.Success -> if (result.items.isEmpty()) {
             EmptyState(category.icon(), "这里还没有${category.title}内容", "已忽略 ${result.ignoredCount} 个不属于本分类的文件。", "刷新", onRefresh)
         } else CategoryContent(category, result, onMedia, onComic)
@@ -461,7 +490,7 @@ private fun CategoryContent(
     when (category) {
         MediaCategory.Comics -> {
             val works = remember(result.items) {
-                result.items.groupBy { it.group }.map { (group, pages) -> ComicWork(group.substringAfterLast('/'), group, pages) }
+                buildComicWorks(result.items)
             }
             ComicGrid(works, result.ignoredCount, result.skippedDirectories, onComic)
         }
@@ -650,7 +679,8 @@ private fun DirectoryGroupHeader(
     onToggle: () -> Unit,
 ) {
     Surface(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onToggle),
+        onClick = onToggle,
+        modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
         color = MaterialTheme.colorScheme.surfaceVariant,
     ) {
@@ -678,6 +708,9 @@ private fun DirectoryGroupHeader(
 @Composable
 private fun ComicGrid(works: List<ComicWork>, ignored: Int, skipped: Int, onComic: (ComicWork) -> Unit) {
     var limit by remember(works) { mutableIntStateOf(minOf(60, works.size)) }
+    val groups = remember(works) { groupComicWorks(works) }
+    val expandedGroups = remember(works) { mutableStateMapOf<String, Boolean>() }
+    val expandedWorkCount = groups.sumOf { if (expandedGroups[it.relativePath] != false) it.works.size else 0 }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(170.dp),
         contentPadding = PaddingValues(12.dp),
@@ -687,21 +720,48 @@ private fun ComicGrid(works: List<ComicWork>, ignored: Int, skipped: Int, onComi
         if (ignored > 0 || skipped > 0) item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
             ScanSummary(ignored, skipped)
         }
-        items(works.take(limit), key = { it.relativePath }) { work ->
-            Card(Modifier.clickable { onComic(work) }) {
-                AsyncImage(
-                    model = work.cover.uri,
-                    contentDescription = work.name,
-                    modifier = Modifier.fillMaxWidth().height(220.dp).background(MaterialTheme.colorScheme.surfaceVariant),
-                    contentScale = ContentScale.Crop,
+        var remainingWorks = limit
+        groups.forEach { group ->
+            val expanded = expandedGroups[group.relativePath] != false
+            item(
+                key = "comic-group:${group.relativePath}",
+                span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) },
+            ) {
+                DirectoryGroupHeader(
+                    name = group.name,
+                    count = group.works.size,
+                    expanded = expanded,
+                    onToggle = { expandedGroups[group.relativePath] = !expanded },
                 )
-                Column(Modifier.padding(12.dp)) {
-                    Text(work.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold)
-                    Text("${work.pages.size} 页 · ${work.relativePath}", maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (expanded && remainingWorks > 0) {
+                val visibleWorks = group.works.take(remainingWorks)
+                remainingWorks -= visibleWorks.size
+                items(visibleWorks, key = { "comic-work:${it.relativePath}" }) { work ->
+                    Card(Modifier.clickable { onComic(work) }) {
+                        AsyncImage(
+                            model = work.cover.uri,
+                            contentDescription = work.name,
+                            modifier = Modifier.fillMaxWidth().height(220.dp).background(MaterialTheme.colorScheme.surfaceVariant),
+                            contentScale = ContentScale.Crop,
+                        )
+                        Column(Modifier.padding(12.dp)) {
+                            Text(work.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold)
+                            Text("${work.pages.size} 页 · ${work.relativePath.ifEmpty { "根目录" }}", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
                 }
             }
         }
-        if (limit < works.size) item { LaunchedEffect(limit) { limit = minOf(works.size, limit + 60) } }
+        if (limit < expandedWorkCount) item(
+            key = "comic-load-more",
+            span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) },
+        ) {
+            LaunchedEffect(limit, expandedWorkCount) { limit = minOf(expandedWorkCount, limit + 60) }
+            Box(Modifier.fillMaxWidth().padding(12.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(Modifier.size(24.dp))
+            }
+        }
     }
 }
 

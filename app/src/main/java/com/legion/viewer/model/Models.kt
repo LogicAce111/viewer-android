@@ -74,18 +74,28 @@ sealed interface ScanResult {
     data class Loading(
         val progress: ScanProgress = ScanProgress(0, ""),
         val previous: Success? = null,
+        val fromIndex: Boolean = false,
     ) : ScanResult
     data class Success(
         val items: List<MediaItem>,
         val ignoredCount: Int,
         val skippedDirectories: Int,
     ) : ScanResult
-    data class Failure(val message: String) : ScanResult
+    data class Failure(val message: String, val previous: Success? = null) : ScanResult
+}
+
+fun ScanResult.availableContent(): ScanResult.Success? = when (this) {
+    is ScanResult.Success -> this
+    is ScanResult.Loading -> previous
+    is ScanResult.Failure -> previous
+    ScanResult.NotConfigured -> null
 }
 
 enum class PlaybackState { Idle, Opening, Playing, Paused, Ended, Error }
 
 enum class PlaybackOpenStage { None, Accessing, Preparing, RetryingSoftware }
+
+data class PlaybackResumeNotice(val requestId: Long, val expiresAtElapsedMs: Long)
 
 data class PlaybackSnapshot(
     val state: PlaybackState = PlaybackState.Idle,
@@ -98,4 +108,5 @@ data class PlaybackSnapshot(
     val canRetry: Boolean = false,
     val openStage: PlaybackOpenStage = PlaybackOpenStage.None,
     val message: String = "",
+    val resumeNotice: PlaybackResumeNotice? = null,
 )

@@ -25,8 +25,8 @@ android {
         applicationId = "com.legion.viewer"
         minSdk = 26
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 4
+        versionName = "1.2.0"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -71,6 +71,7 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     // Keep Compose libraries aligned while compiling and targeting Android API 37.
     val composeBom = platform("androidx.compose:compose-bom:2026.06.01")
     implementation(composeBom)

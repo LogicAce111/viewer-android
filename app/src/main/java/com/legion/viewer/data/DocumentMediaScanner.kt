@@ -43,14 +43,14 @@ class DocumentMediaScanner(private val resolver: ContentResolver) : MediaScanner
                     throw cancelled
                 } catch (security: SecurityException) {
                     if (directory.isRoot) throw security
-                    skipped++
                     null
-                } catch (_: Exception) {
-                    skipped++
+                } catch (error: Exception) {
+                    if (directory.isRoot) throw error
                     null
                 }
                 if (cursor == null) {
                     if (directory.isRoot) return@withContext ScanResult.Failure("无法读取所选目录，请重新选择目录。")
+                    skipped++
                     continue
                 }
 
@@ -93,7 +93,8 @@ class DocumentMediaScanner(private val resolver: ContentResolver) : MediaScanner
                 } catch (security: SecurityException) {
                     if (directory.isRoot) throw security
                     skipped++
-                } catch (_: Exception) {
+                } catch (error: Exception) {
+                    if (directory.isRoot) throw error
                     skipped++
                 }
             }

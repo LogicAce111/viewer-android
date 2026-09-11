@@ -385,6 +385,14 @@ object ViewerIcons {
         }
     }
 
+    val ReturnTop: ImageVector by lazy {
+        lineIcon("Viewer.ReturnTop") {
+            moveTo(5f, 4f); lineTo(19f, 4f)
+            moveTo(12f, 20f); lineTo(12f, 8f)
+            moveTo(6f, 14f); lineTo(12f, 8f); lineTo(18f, 14f)
+        }
+    }
+
     val Shuffle: ImageVector by lazy {
         lineIcon("Viewer.Shuffle") {
             moveTo(4f, 7f); lineTo(6.5f, 7f)

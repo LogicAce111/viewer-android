@@ -2,6 +2,7 @@ package com.legion.viewer.playback
 
 import android.app.Application
 import android.content.Intent
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import com.legion.viewer.data.LocalLog
 import com.legion.viewer.data.PreferencesRepository
@@ -11,6 +12,7 @@ import com.legion.viewer.model.MediaItem
 import com.legion.viewer.model.PlaybackOpenStage
 import com.legion.viewer.model.PlaybackOrder
 import com.legion.viewer.model.PlaybackSnapshot
+import com.legion.viewer.model.PlaybackResumeNotice
 import com.legion.viewer.model.PlaybackState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -48,6 +50,8 @@ class PlaybackController(
     private var currentIndex = -1
     private var order = PlaybackOrder.Sequential
     private var pendingSeek = 0L
+    private var resumeAttempt: PlaybackResumeAttempt? = null
+    private var playerGeneration = 0L
     private var attachedLayout: VLCVideoLayout? = null
     private var currentSource: SafMediaSource? = null
     private var openJob: Job? = null
@@ -63,10 +67,6 @@ class PlaybackController(
         private set
 
     init {
-        player.setEventListener { event ->
-            val type = event.type
-            scope.launch { handlePlayerEvent(type) }
-        }
         scope.launch {
             preferences.settings.collectLatest { settings ->
                 volume = settings.volume
@@ -87,6 +87,8 @@ class PlaybackController(
     fun open(items: List<MediaItem>, item: MediaItem, autoPlay: Boolean = true, savePrevious: Boolean = true) {
         if (items.isEmpty()) return
         val version = ++requestVersion
+        resumeAttempt = null
+        _snapshot.value = _snapshot.value.copy(resumeNotice = null)
         openJob?.cancel()
         openingTimeoutJob?.cancel()
         openJob = scope.launch {
@@ -96,7 +98,9 @@ class PlaybackController(
             currentIndex = items.indexOfFirst { it.uri == item.uri }.coerceAtLeast(0)
             val target = queue[currentIndex]
             softwareRetryAttempted = false
-            pendingSeek = progress.get(target.category, target.uri)?.positionMs ?: 0L
+            val saved = progress.get(target.category, target.uri)
+            pendingSeek = saved?.takeUnless { it.completed }?.positionMs?.coerceAtLeast(0) ?: 0L
+            resumeAttempt = pendingSeek.takeIf { it > 0 }?.let { PlaybackResumeAttempt(version, it) }
             openTarget(version, target, autoPlay, softwareDecode = false)
         }
     }
@@ -151,6 +155,8 @@ class PlaybackController(
     }
 
     fun seekTo(positionMs: Long) {
+        resumeAttempt?.cancel()
+        pendingSeek = 0
         if (_snapshot.value.canSeek && player.isSeekable) {
             player.time = positionMs.coerceIn(0, player.length.coerceAtLeast(0))
             publishPosition()
@@ -158,6 +164,12 @@ class PlaybackController(
     }
 
     fun seekBy(deltaMs: Long) = seekTo(player.time + deltaMs)
+
+    fun consumeResumeNotice(requestId: Long) {
+        if (_snapshot.value.resumeNotice?.requestId == requestId) {
+            _snapshot.value = _snapshot.value.copy(resumeNotice = null)
+        }
+    }
     fun previous() = moveTo(if (currentIndex <= 0) queue.lastIndex else currentIndex - 1)
     fun next() = moveTo(nextIndex())
 
@@ -269,6 +281,14 @@ class PlaybackController(
             media.release()
             currentSource = openedSource
             openedSource = null
+            val generation = ++playerGeneration
+            player.setEventListener { event ->
+                val type = event.type
+                val reportedTime = if (type == MediaPlayer.Event.TimeChanged) event.timeChanged else null
+                scope.launch {
+                    if (version == requestVersion && generation == playerGeneration) handlePlayerEvent(type, reportedTime)
+                }
+            }
             _snapshot.value = _snapshot.value.copy(
                 state = PlaybackState.Opening,
                 openStage = if (softwareDecode) PlaybackOpenStage.RetryingSoftware else PlaybackOpenStage.Preparing,
@@ -285,7 +305,7 @@ class PlaybackController(
         }
     }
 
-    private suspend fun handlePlayerEvent(type: Int) {
+    private suspend fun handlePlayerEvent(type: Int, reportedTime: Long?) {
         when (type) {
             MediaPlayer.Event.Opening -> {
                 if (_snapshot.value.state != PlaybackState.Error) {
@@ -294,8 +314,7 @@ class PlaybackController(
             }
             MediaPlayer.Event.Playing -> {
                 openingTimeoutJob?.cancel()
-                if (pendingSeek > 0 && pendingSeek < player.length) player.time = pendingSeek
-                pendingSeek = 0L
+                applyPendingSeek()
                 applyAudioSettings()
                 _snapshot.value = _snapshot.value.copy(
                     state = PlaybackState.Playing,
@@ -322,8 +341,27 @@ class PlaybackController(
             }
             MediaPlayer.Event.EndReached -> onEnded()
             MediaPlayer.Event.EncounteredError -> handlePlaybackFailure("媒体无法解码或文件已经损坏。")
-            MediaPlayer.Event.TimeChanged, MediaPlayer.Event.LengthChanged -> publishPosition()
+            MediaPlayer.Event.TimeChanged -> {
+                if (reportedTime != null && resumeAttempt?.confirm(requestVersion, reportedTime, SystemClock.elapsedRealtime()) == true) {
+                    _snapshot.value = _snapshot.value.copy(resumeNotice = PlaybackResumeNotice(requestVersion, SystemClock.elapsedRealtime() + 3_000))
+                }
+                publishPosition()
+            }
+            MediaPlayer.Event.LengthChanged, MediaPlayer.Event.SeekableChanged -> {
+                if (_snapshot.value.state == PlaybackState.Playing) applyPendingSeek()
+                publishPosition()
+            }
         }
+    }
+
+    private fun applyPendingSeek() {
+        val target = pendingSeek
+        if (target <= 0 || player.length <= 0 || !player.isSeekable) return
+        pendingSeek = 0
+        if (target >= player.length) { resumeAttempt?.cancel(); return }
+        val result = player.setTime(target)
+        if (result >= 0 && resumeAttempt?.positionMs == target) resumeAttempt?.submitted(SystemClock.elapsedRealtime())
+        else resumeAttempt?.cancel()
     }
 
     private fun startOpeningTimeout(version: Long) {
@@ -348,6 +386,7 @@ class PlaybackController(
             return
         }
         logPlaybackError("decode", current.category, IllegalStateException("LibVlcEncounteredError"))
+        resumeAttempt?.cancel()
         stopPlayerAndCloseSource()
         _snapshot.value = _snapshot.value.copy(
             state = PlaybackState.Error,
@@ -355,10 +394,12 @@ class PlaybackController(
             canRetry = true,
             openStage = PlaybackOpenStage.None,
             message = message,
+            resumeNotice = null,
         )
     }
 
     private suspend fun failOpen(target: MediaItem, error: Throwable) {
+        resumeAttempt?.cancel()
         openingTimeoutJob?.cancel()
         stopPlayerAndCloseSource()
         logPlaybackError("open", target.category, error)
@@ -425,6 +466,7 @@ class PlaybackController(
     }
 
     private fun stopPlayerAndCloseSource() {
+        playerGeneration++
         runCatching { player.stop() }
         currentSource?.close()
         currentSource = null

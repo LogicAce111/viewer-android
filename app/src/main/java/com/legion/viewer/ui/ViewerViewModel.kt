@@ -8,6 +8,12 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.legion.viewer.ViewerApplication
 import com.legion.viewer.data.AppContainer
+import com.legion.viewer.data.IndexLoadException
+import com.legion.viewer.data.IndexOperationQueue
+import com.legion.viewer.data.IndexSource
+import com.legion.viewer.data.indexSource
+import com.legion.viewer.data.toSavedIndex
+import com.legion.viewer.data.toScanResult
 import com.legion.viewer.model.AppSettings
 import com.legion.viewer.model.AppTheme
 import com.legion.viewer.model.ComicWork
@@ -17,13 +23,20 @@ import com.legion.viewer.model.MediaItem
 import com.legion.viewer.model.PlaybackOrder
 import com.legion.viewer.model.ReaderAppearance
 import com.legion.viewer.model.ScanResult
-import kotlinx.coroutines.Job
+import com.legion.viewer.model.availableContent
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.coroutineContext
 
 sealed interface ViewerScreen {
     data object Home : ViewerScreen
@@ -47,8 +60,9 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     val screen: StateFlow<ViewerScreen> = _screen.asStateFlow()
     private val _scans = MutableStateFlow(MediaCategory.entries.associateWith<MediaCategory, ScanResult> { ScanResult.NotConfigured })
     val scans: StateFlow<Map<MediaCategory, ScanResult>> = _scans.asStateFlow()
-    private val scanJobs = mutableMapOf<MediaCategory, Job>()
+    private val indexOperations = IndexOperationQueue(viewModelScope)
     private val loaded = mutableSetOf<MediaCategory>()
+    private val contentSources = mutableMapOf<MediaCategory, IndexSource>()
     private val backStack = ArrayDeque<ViewerScreen>()
 
     fun navigate(target: ViewerScreen, rememberCurrent: Boolean = true) {
@@ -85,52 +99,105 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         runCatching {
             resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }.onFailure { container.log.error("persist-uri", it) }
-        viewModelScope.launch {
-            val name = queryDirectoryName(uri)
+        runIndexOperation(category) {
+            // Invalidate before saving the source so even A -> B -> A requires a new import.
+            container.mediaIndex.clear(category.name)
+            contentSources.remove(category)
+            _scans.update { it + (category to ScanResult.Loading()) }
+            val name = withContext(Dispatchers.IO) { queryDirectoryName(uri) }
             container.preferences.setSource(category, uri, name)
-            loaded.remove(category)
-            startScan(CategorySource(category, uri, name, enabled = true), retainPrevious = false)
+            loadIndex(CategorySource(category, uri, name, enabled = true), refresh = true, retainPrevious = false)
         }
     }
 
     fun clearDirectory(category: MediaCategory) {
-        scanJobs.remove(category)?.cancel()
-        viewModelScope.launch {
+        runIndexOperation(category) {
+            container.mediaIndex.clear(category.name)
             container.preferences.setSource(category, null)
-            loaded.remove(category)
-            _scans.value = _scans.value + (category to ScanResult.NotConfigured)
+            contentSources.remove(category)
+            _scans.update { it + (category to ScanResult.NotConfigured) }
         }
     }
 
     fun ensureScanned(category: MediaCategory) {
-        if (category !in loaded) refresh(category)
+        if (category in loaded || indexOperations.isActive(category.name)) return
+        runIndexOperation(category) {
+            _scans.update { it + (category to ScanResult.Loading(fromIndex = true)) }
+            // Await DataStore instead of the temporary AppSettings() value from stateIn.
+            val source = container.preferences.settings.first().sources.getValue(category)
+            loadIndex(source, refresh = false, retainPrevious = false)
+        }
     }
 
     fun refresh(category: MediaCategory) {
-        val source = settings.value.sources.getValue(category)
-        if (!source.enabled) {
-            _scans.value = _scans.value + (category to ScanResult.NotConfigured)
-            return
+        runIndexOperation(category) {
+            val source = container.preferences.settings.first().sources.getValue(category)
+            loadIndex(source, refresh = true, retainPrevious = true)
         }
-        startScan(source, retainPrevious = true)
     }
 
-    private fun startScan(source: CategorySource, retainPrevious: Boolean) {
-        val category = source.category
-        scanJobs.remove(category)?.cancel()
-        val previous = (_scans.value[category] as? ScanResult.Success).takeIf { retainPrevious }
-        scanJobs[category] = viewModelScope.launch {
-            _scans.value = _scans.value + (category to ScanResult.Loading(previous = previous))
-            val result = container.scanner.scan(source) { progress ->
-                _scans.value = _scans.value + (category to ScanResult.Loading(progress, previous))
+    private fun runIndexOperation(category: MediaCategory, action: suspend () -> Unit) {
+        indexOperations.replace(category.name) {
+            try {
+                action()
+                coroutineContext.ensureActive()
+                loaded += category
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                coroutineContext.ensureActive()
+                container.log.errorType("media-index", error)
+                val previous = _scans.value[category]?.availableContent() ?: (error as? IndexLoadException)?.previous?.let { saved ->
+                    withContext(Dispatchers.IO) { saved.toScanResult() }
+                }
+                _scans.update {
+                    it + (category to ScanResult.Failure(
+                        (error as? IndexLoadException)?.message ?: "目录索引操作失败，请手动刷新或重新选择目录。",
+                        previous,
+                    ))
+                }
+                // Do not turn page navigation into automatic retries/scans after an error.
+                loaded += category
             }
-            _scans.value = _scans.value + (category to result)
-            if (result is ScanResult.Success) loaded += category
         }
+    }
+
+    private suspend fun loadIndex(source: CategorySource, refresh: Boolean, retainPrevious: Boolean) {
+        val category = source.category
+        if (!source.enabled || source.treeUri == null) {
+            contentSources.remove(category)
+            _scans.update { it + (category to ScanResult.NotConfigured) }
+            return
+        }
+        val request = source.indexSource()
+        var previous = _scans.value[category]?.availableContent().takeIf {
+            retainPrevious && contentSources[category] == request
+        }
+        contentSources[category] = request
+        _scans.update { it + (category to ScanResult.Loading(previous = previous, fromIndex = true)) }
+        val (content, warning) = withContext(Dispatchers.IO) {
+            val loadedIndex = container.indexLoader.load(request, refresh, onScanning = { cached ->
+                previous = previous ?: cached?.toScanResult()
+                _scans.update { it + (category to ScanResult.Loading(previous = previous)) }
+            }) {
+                val scanContext = coroutineContext
+                when (val scan = container.scanner.scan(source) { progress ->
+                    scanContext.ensureActive()
+                    _scans.update { it + (category to ScanResult.Loading(progress, previous)) }
+                }) {
+                    is ScanResult.Success -> scan.toSavedIndex(request)
+                    is ScanResult.Failure -> throw IndexLoadException(scan.message)
+                    else -> throw IndexLoadException("目录未配置，请重新选择目录。")
+                }
+            }
+            loadedIndex.index.toScanResult() to loadedIndex.warning
+        }
+        coroutineContext.ensureActive()
+        _scans.update { it + (category to if (warning == null) content else ScanResult.Failure(warning, content)) }
     }
 
     fun openMedia(item: MediaItem) {
-        val result = scans.value[item.category] as? ScanResult.Success ?: return
+        val result = scans.value[item.category]?.availableContent() ?: return
         when (item.category) {
             MediaCategory.Video, MediaCategory.Music -> {
                 container.playback.open(result.items, item)
@@ -152,6 +219,9 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     fun setPlaybackOrder(value: PlaybackOrder) = container.playback.setOrder(value)
     fun saveTextProgress(item: MediaItem, ratio: Float) = viewModelScope.launch {
         container.progress.saveText(item, ratio)
+    }
+    fun saveComicProgress(work: ComicWork, index: Int, offset: Int) = viewModelScope.launch {
+        container.progress.saveComic(work.cover, index.coerceIn(work.pages.indices), offset)
     }
 
     private fun queryDirectoryName(uri: Uri): String {

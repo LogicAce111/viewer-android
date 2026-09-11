@@ -4,6 +4,7 @@ package com.legion.viewer.ui
 
 import android.app.Activity
 import android.content.pm.ActivityInfo
+import android.os.SystemClock
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -19,14 +20,19 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -74,6 +80,7 @@ import com.legion.viewer.model.MediaCategory
 import com.legion.viewer.model.PlaybackOpenStage
 import com.legion.viewer.model.PlaybackOrder
 import com.legion.viewer.model.PlaybackSnapshot
+import com.legion.viewer.model.PlaybackResumeNotice
 import com.legion.viewer.model.PlaybackState
 import kotlinx.coroutines.delay
 import org.videolan.libvlc.util.VLCVideoLayout
@@ -93,6 +100,7 @@ fun PlayerScreen(model: ViewerViewModel, onBack: () -> Unit) {
     var controlLayer by remember(snapshot.current?.uri) { mutableStateOf(PlayerControlLayer.Transport) }
     var interactionVersion by remember { mutableIntStateOf(0) }
     var activelySeeking by remember { mutableStateOf(false) }
+    var resumeHint by remember(snapshot.current?.uri) { mutableStateOf<PlaybackResumeNotice?>(null) }
 
     fun registerInteraction() {
         interactionVersion += 1
@@ -102,6 +110,25 @@ fun PlayerScreen(model: ViewerViewModel, onBack: () -> Unit) {
         controlLayer = PlayerControlLayer.Transport
         controlsVisible = true
         registerInteraction()
+    }
+
+    LaunchedEffect(snapshot.resumeNotice) {
+        snapshot.resumeNotice?.let { notice ->
+            controller.consumeResumeNotice(notice.requestId)
+            if (notice.expiresAtElapsedMs > SystemClock.elapsedRealtime()) {
+                resumeHint = notice
+                revealTransport()
+            }
+        }
+    }
+    LaunchedEffect(resumeHint) {
+        resumeHint?.let { notice ->
+            delay((notice.expiresAtElapsedMs - SystemClock.elapsedRealtime()).coerceAtLeast(0))
+            resumeHint = null
+        }
+    }
+    LaunchedEffect(snapshot.state) {
+        if (snapshot.state == PlaybackState.Opening || snapshot.state == PlaybackState.Error) resumeHint = null
     }
 
     fun setFullscreen(value: Boolean) {
@@ -212,7 +239,8 @@ fun PlayerScreen(model: ViewerViewModel, onBack: () -> Unit) {
             )
             AnimatedVisibility(
                 visible = controlsVisible,
-                modifier = Modifier.align(Alignment.TopCenter),
+                modifier = Modifier.align(Alignment.TopCenter)
+                    .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)),
                 enter = fadeIn() + slideInVertically { -it / 3 },
                 exit = fadeOut() + slideOutVertically { -it / 3 },
             ) {
@@ -234,20 +262,24 @@ fun PlayerScreen(model: ViewerViewModel, onBack: () -> Unit) {
             }
             AnimatedVisibility(
                 visible = controlsVisible,
-                modifier = Modifier.align(Alignment.BottomCenter),
+                modifier = Modifier.align(Alignment.BottomCenter)
+                    .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Bottom + WindowInsetsSides.Horizontal)),
                 enter = fadeIn() + slideInVertically { it / 3 },
                 exit = fadeOut() + slideOutVertically { it / 3 },
             ) {
-                PlayerBottomLayer(
-                    snapshot = snapshot,
-                    settings = settings,
-                    fullscreen = fullscreen,
-                    layer = controlLayer,
-                    videoOverlay = true,
-                    callbacks = commonControls,
-                    onInteraction = ::registerInteraction,
-                    onSeekingChanged = { activelySeeking = it },
-                )
+                Column {
+                    if (resumeHint != null) ResumePositionHint(reading = false, modifier = Modifier.padding(start = 16.dp, bottom = 6.dp))
+                    PlayerBottomLayer(
+                        snapshot = snapshot,
+                        settings = settings,
+                        fullscreen = fullscreen,
+                        layer = controlLayer,
+                        videoOverlay = true,
+                        callbacks = commonControls,
+                        onInteraction = ::registerInteraction,
+                        onSeekingChanged = { activelySeeking = it },
+                    )
+                }
             }
             PlaybackStateOverlay(snapshot, true, Modifier.fillMaxSize(), onBack, controller::retry)
         }
@@ -331,6 +363,10 @@ fun PlayerScreen(model: ViewerViewModel, onBack: () -> Unit) {
                         )
                     }
                 }
+                }
+                if (resumeHint != null) {
+                    ResumePositionHint(reading = false, modifier = Modifier.align(Alignment.BottomStart)
+                        .padding(start = 16.dp, bottom = padding.calculateBottomPadding() + 6.dp))
                 }
                 PlaybackStateOverlay(snapshot, false, Modifier.fillMaxSize().padding(padding), onBack, controller::retry)
             }
