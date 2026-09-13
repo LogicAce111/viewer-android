@@ -14,6 +14,25 @@ import androidx.compose.ui.unit.dp
  * 避免底部导航与分类入口呈现为 Android 默认实心图标。
  */
 object ViewerIcons {
+    val Search: ImageVector by lazy {
+        lineIcon("Viewer.Search") {
+            moveTo(16.5f, 10f)
+            curveTo(16.5f, 13.6f, 13.6f, 16.5f, 10f, 16.5f)
+            curveTo(6.4f, 16.5f, 3.5f, 13.6f, 3.5f, 10f)
+            curveTo(3.5f, 6.4f, 6.4f, 3.5f, 10f, 3.5f)
+            curveTo(13.6f, 3.5f, 16.5f, 6.4f, 16.5f, 10f)
+            close()
+            moveTo(14.7f, 14.7f); lineTo(21f, 21f)
+        }
+    }
+
+    val Clear: ImageVector by lazy {
+        lineIcon("Viewer.Clear") {
+            moveTo(6f, 6f); lineTo(18f, 18f)
+            moveTo(18f, 6f); lineTo(6f, 18f)
+        }
+    }
+
     val Home: ImageVector by lazy {
         lineIcon("Viewer.Home") {
             moveTo(3.5f, 10.5f)

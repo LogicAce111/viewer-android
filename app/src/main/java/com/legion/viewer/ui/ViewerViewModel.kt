@@ -6,6 +6,7 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.compose.runtime.mutableStateMapOf
 import com.legion.viewer.ViewerApplication
 import com.legion.viewer.data.AppContainer
 import com.legion.viewer.data.IndexLoadException
@@ -14,6 +15,7 @@ import com.legion.viewer.data.IndexSource
 import com.legion.viewer.data.indexSource
 import com.legion.viewer.data.toSavedIndex
 import com.legion.viewer.data.toScanResult
+import com.legion.viewer.data.snapshotPlaybackQueue
 import com.legion.viewer.model.AppSettings
 import com.legion.viewer.model.AppTheme
 import com.legion.viewer.model.ComicWork
@@ -63,16 +65,30 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
     private val indexOperations = IndexOperationQueue(viewModelScope)
     private val loaded = mutableSetOf<MediaCategory>()
     private val contentSources = mutableMapOf<MediaCategory, IndexSource>()
-    private val backStack = ArrayDeque<ViewerScreen>()
+    private val browseStates = mutableStateMapOf<MediaCategory, CategoryBrowseState>().apply {
+        MediaCategory.entries.forEach { put(it, CategoryBrowseState()) }
+    }
+    internal fun browseState(category: MediaCategory): CategoryBrowseState = browseStates.getValue(category)
+    private val searchStates = MediaCategory.entries.associateWith { CategorySearchState(it, viewModelScope) }
+    internal fun searchState(category: MediaCategory): CategorySearchState = searchStates.getValue(category)
+    private val settingsNavigation = SettingsNavigation()
 
-    fun navigate(target: ViewerScreen, rememberCurrent: Boolean = true) {
-        if (rememberCurrent && _screen.value != target) backStack.addLast(_screen.value)
+    init {
+        viewModelScope.launch {
+            scans.collect { states ->
+                states.forEach { (category, result) -> searchState(category).updateContent(result.availableContent()?.items) }
+            }
+        }
+    }
+
+    fun navigate(target: ViewerScreen) {
+        settingsNavigation.navigating(_screen.value, target)
         _screen.value = target
         if (target is ViewerScreen.Category) ensureScanned(target.category)
     }
 
     fun navigateTopLevel(target: ViewerScreen) {
-        backStack.clear()
+        settingsNavigation.clear()
         _screen.value = target
         if (target is ViewerScreen.Category) ensureScanned(target.category)
     }
@@ -82,12 +98,13 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         if (current == ViewerScreen.Player && playback.value.isVideo) container.playback.pauseVideoForBackground()
         val target = when (current) {
             ViewerScreen.Home -> ViewerScreen.Home
-            ViewerScreen.Settings, is ViewerScreen.Category -> ViewerScreen.Home
+            ViewerScreen.Settings -> settingsNavigation.takeReturnTarget()
+            is ViewerScreen.Category -> ViewerScreen.Home
             ViewerScreen.Player -> playback.value.current?.category?.let { ViewerScreen.Category(it) } ?: ViewerScreen.Home
             is ViewerScreen.TextReader -> ViewerScreen.Category(MediaCategory.Text)
             is ViewerScreen.ComicReader -> ViewerScreen.Category(MediaCategory.Comics)
         }
-        backStack.clear()
+        settingsNavigation.clear()
         _screen.value = target
         if (target is ViewerScreen.Category) ensureScanned(target.category)
     }
@@ -103,6 +120,8 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
             // Invalidate before saving the source so even A -> B -> A requires a new import.
             container.mediaIndex.clear(category.name)
             contentSources.remove(category)
+            browseStates[category] = CategoryBrowseState()
+            searchState(category).resetSource()
             _scans.update { it + (category to ScanResult.Loading()) }
             val name = withContext(Dispatchers.IO) { queryDirectoryName(uri) }
             container.preferences.setSource(category, uri, name)
@@ -115,6 +134,8 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
             container.mediaIndex.clear(category.name)
             container.preferences.setSource(category, null)
             contentSources.remove(category)
+            browseStates[category] = CategoryBrowseState()
+            searchState(category).resetSource()
             _scans.update { it + (category to ScanResult.NotConfigured) }
         }
     }
@@ -196,11 +217,12 @@ class ViewerViewModel(application: Application) : AndroidViewModel(application) 
         _scans.update { it + (category to if (warning == null) content else ScanResult.Failure(warning, content)) }
     }
 
-    fun openMedia(item: MediaItem) {
-        val result = scans.value[item.category]?.availableContent() ?: return
+    fun openMedia(item: MediaItem, queue: List<MediaItem>? = null) {
+        val items = queue ?: scans.value[item.category]?.availableContent()?.items ?: return
+        val playbackItems = snapshotPlaybackQueue(items, item) ?: return
         when (item.category) {
             MediaCategory.Video, MediaCategory.Music -> {
-                container.playback.open(result.items, item)
+                container.playback.open(playbackItems, item)
                 navigate(ViewerScreen.Player)
             }
             MediaCategory.Text -> navigate(ViewerScreen.TextReader(item))

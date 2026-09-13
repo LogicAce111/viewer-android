@@ -26,6 +26,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -57,8 +60,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -69,6 +70,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -82,6 +86,7 @@ import com.legion.viewer.model.MediaCategory
 import com.legion.viewer.model.MediaItem
 import com.legion.viewer.model.PlaybackState
 import com.legion.viewer.model.ScanResult
+import com.legion.viewer.model.availableContent
 import com.legion.viewer.ViewerApplication
 import com.legion.viewer.R
 import com.legion.viewer.data.MediaNaturalComparator
@@ -98,6 +103,20 @@ fun ViewerApp(model: ViewerViewModel) {
     val playback by model.playback.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val activity = context as? Activity
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val currentCategory = (screen as? ViewerScreen.Category)?.category
+    val currentSearch = currentCategory?.let(model::searchState)
+    val dismissKeyboard: () -> Unit = { focusManager.clearFocus(); keyboard?.hide() }
+    val navigate: (ViewerScreen) -> Unit = { dismissKeyboard(); model.navigate(it) }
+    val navigateTopLevel: (ViewerScreen) -> Unit = { dismissKeyboard(); model.navigateTopLevel(it) }
+    val goBack: () -> Unit = {
+        if (currentSearch?.isOpen == true) {
+            dismissKeyboard()
+            currentSearch.close()
+        } else model.navigateUp()
+    }
     var lastHomeBackPress by remember { mutableLongStateOf(0L) }
     var pendingCategory by remember { mutableStateOf<MediaCategory?>(null) }
     val directoryPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -111,7 +130,7 @@ fun ViewerApp(model: ViewerViewModel) {
     }
 
     LaunchedEffect(screen) { lastHomeBackPress = 0L }
-    BackHandler(enabled = screen != ViewerScreen.Player) {
+    BackHandler(enabled = screen != ViewerScreen.Player && !(currentSearch?.isOpen == true && imeVisible)) {
         if (screen == ViewerScreen.Home) {
             val now = SystemClock.elapsedRealtime()
             if (now - lastHomeBackPress <= 2_000L) {
@@ -121,7 +140,7 @@ fun ViewerApp(model: ViewerViewModel) {
                 Toast.makeText(context, "再按一次返回键退出", Toast.LENGTH_SHORT).show()
             }
         } else {
-            model.navigateUp()
+            goBack()
         }
     }
 
@@ -140,29 +159,35 @@ fun ViewerApp(model: ViewerViewModel) {
             BoxWithConstraints(Modifier.fillMaxSize()) {
                 val wide = maxWidth >= 700.dp
                 Row(Modifier.fillMaxSize()) {
-                    if (wide) ViewerRail(navigation, screen, model::navigateTopLevel)
+                    if (wide) ViewerRail(navigation, screen, navigateTopLevel)
                     Scaffold(
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier.weight(1f).imePadding(),
                         topBar = {
-                            ViewerTopBar(
-                                screen = screen,
-                                onBack = if (screen == ViewerScreen.Home) null else model::navigateUp,
-                                    onSettings = { model.navigate(ViewerScreen.Settings) },
-                                onRefresh = (screen as? ViewerScreen.Category)?.let { { model.refresh(it.category) } },
-                            )
+                            Column {
+                                ViewerTopBar(
+                                    screen = screen,
+                                    onBack = if (screen == ViewerScreen.Home) null else goBack,
+                                    onSettings = { navigate(ViewerScreen.Settings) },
+                                    onSearch = currentSearch?.let { { it.open() } },
+                                    onRefresh = currentCategory?.let { { model.refresh(it) } },
+                                )
+                                if (currentSearch?.isOpen == true) {
+                                    CategorySearchBar(currentSearch) { dismissKeyboard(); currentSearch.close() }
+                                }
+                            }
                         },
                         bottomBar = {
                             if (!wide) {
                                 Column {
-                                    if (playback.current?.category == MediaCategory.Music) MiniPlayer(model)
-                                    ViewerBottomBar(navigation, screen, model::navigateTopLevel)
+                                    if (playback.current?.category == MediaCategory.Music) MiniPlayer(model) { navigate(ViewerScreen.Player) }
+                                    ViewerBottomBar(navigation, screen, navigateTopLevel)
                                 }
                             }
                         },
                     ) { padding ->
                         Box(Modifier.fillMaxSize().padding(padding)) {
                             when (screen) {
-                                ViewerScreen.Home -> HomeScreen(settings, chooseDirectory) { model.navigate(it) }
+                                ViewerScreen.Home -> HomeScreen(settings, chooseDirectory, navigate)
                                 ViewerScreen.Settings -> SettingsScreen(
                                     settings = settings,
                                     onChoose = chooseDirectory,
@@ -171,19 +196,29 @@ fun ViewerApp(model: ViewerViewModel) {
                                 )
                                 is ViewerScreen.Category -> {
                                     val categoryScreen = screen as ViewerScreen.Category
-                                    CategoryScreen(
+                                    val search = model.searchState(categoryScreen.category)
+                                    if (search.isFiltering) CategorySearchResults(
                                         category = categoryScreen.category,
+                                        search = search,
+                                        source = scans.getValue(categoryScreen.category),
+                                        onChoose = { chooseDirectory(categoryScreen.category) },
+                                        onRefresh = { model.refresh(categoryScreen.category) },
+                                        onMedia = { item, queue -> dismissKeyboard(); model.openMedia(item, queue) },
+                                        onComic = { dismissKeyboard(); model.openComic(it) },
+                                    ) else CategoryScreen(
+                                        category = categoryScreen.category,
+                                        browse = model.browseState(categoryScreen.category),
                                         result = scans.getValue(categoryScreen.category),
                                         onChoose = { chooseDirectory(categoryScreen.category) },
                                         onRefresh = { model.refresh(categoryScreen.category) },
-                                        onMedia = model::openMedia,
-                                        onComic = model::openComic,
+                                        onMedia = { dismissKeyboard(); model.openMedia(it) },
+                                        onComic = { dismissKeyboard(); model.openComic(it) },
                                     )
                                 }
                                 else -> Unit
                             }
                             if (wide && playback.current?.category == MediaCategory.Music) {
-                                Box(Modifier.align(Alignment.BottomCenter).padding(12.dp)) { MiniPlayer(model) }
+                                Box(Modifier.align(Alignment.BottomCenter).padding(12.dp)) { MiniPlayer(model) { navigate(ViewerScreen.Player) } }
                             }
                         }
                     }
@@ -198,6 +233,7 @@ private fun ViewerTopBar(
     screen: ViewerScreen,
     onBack: (() -> Unit)?,
     onSettings: () -> Unit,
+    onSearch: (() -> Unit)?,
     onRefresh: (() -> Unit)?,
 ) {
     val title = when (screen) {
@@ -225,6 +261,7 @@ private fun ViewerTopBar(
         },
         navigationIcon = { if (onBack != null) IconButton(onClick = onBack) { Icon(ViewerIcons.Back, "返回") } },
         actions = {
+            if (onSearch != null) IconButton(onClick = onSearch) { Icon(ViewerIcons.Search, "搜索") }
             if (onRefresh != null) IconButton(onClick = onRefresh) { Icon(ViewerIcons.Refresh, "刷新") }
             if (screen != ViewerScreen.Settings) IconButton(onClick = onSettings) { Icon(ViewerIcons.Settings, "设置") }
         },
@@ -414,6 +451,7 @@ private fun SettingsScreen(
 @Composable
 private fun CategoryScreen(
     category: MediaCategory,
+    browse: CategoryBrowseState,
     result: ScanResult,
     onChoose: () -> Unit,
     onRefresh: () -> Unit,
@@ -433,7 +471,7 @@ private fun CategoryScreen(
                 )
             } else {
                 Box(Modifier.fillMaxSize()) {
-                    CategoryContent(category, previous, onMedia, onComic)
+                    CategoryContent(category, previous, browse, onMedia, onComic)
                     Surface(
                         modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth(),
                         color = MaterialTheme.colorScheme.surface,
@@ -469,14 +507,70 @@ private fun CategoryScreen(
                         }
                     }
                     Box(Modifier.weight(1f)) {
-                        CategoryScreen(category, previous, onChoose, onRefresh, onMedia, onComic)
+                        CategoryScreen(category, browse, previous, onChoose, onRefresh, onMedia, onComic)
                     }
                 }
             }
         }
         is ScanResult.Success -> if (result.items.isEmpty()) {
+            browse.prepare(emptyList(), summary = false)
             EmptyState(category.icon(), "这里还没有${category.title}内容", "已忽略 ${result.ignoredCount} 个不属于本分类的文件。", "刷新", onRefresh)
-        } else CategoryContent(category, result, onMedia, onComic)
+        } else CategoryContent(category, result, browse, onMedia, onComic)
+    }
+}
+
+@Composable
+private fun CategorySearchResults(
+    category: MediaCategory,
+    search: CategorySearchState,
+    source: ScanResult,
+    onChoose: () -> Unit,
+    onRefresh: () -> Unit,
+    onMedia: (MediaItem, List<MediaItem>) -> Unit,
+    onComic: (ComicWork) -> Unit,
+) {
+    if (source.availableContent() == null) {
+        CategoryScreen(category, search.browse, source, onChoose, onRefresh, { onMedia(it, listOf(it)) }, onComic)
+        return
+    }
+    Column(Modifier.fillMaxSize()) {
+        if (source is ScanResult.Failure) {
+            Surface(color = MaterialTheme.colorScheme.errorContainer) {
+                Row(Modifier.fillMaxWidth().padding(start = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(source.message, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = onRefresh) { Text("刷新") }
+                }
+            }
+        } else if (source is ScanResult.Loading) {
+            LinearProgressIndicator(Modifier.fillMaxWidth())
+            Text("正在更新目录", Modifier.padding(horizontal = 12.dp, vertical = 4.dp), style = MaterialTheme.typography.bodySmall)
+        }
+        val matches = search.results
+        when {
+            search.error != null -> EmptyState(ViewerIcons.Search, "搜索失败", search.error.orEmpty(), "重试", search::retry)
+            search.isSearching || matches == null -> EmptyState(ViewerIcons.Search, "正在搜索", "", null, null, loading = true)
+            else -> {
+                Text(
+                    "找到 ${matches.count} ${if (category == MediaCategory.Comics) "本漫画" else "个文件"}",
+                    Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Box(Modifier.weight(1f)) {
+                    if (matches.count == 0) {
+                        search.browse.prepare(emptyList(), summary = false)
+                        EmptyState(ViewerIcons.Search, "未找到相关内容", "请尝试其他名称或目录关键词。", "清空关键词", { search.updateQuery("") })
+                    } else CategoryContent(
+                        category,
+                        ScanResult.Success(matches.items, ignoredCount = 0, skippedDirectories = 0),
+                        search.browse,
+                        { onMedia(it, matches.items) },
+                        onComic,
+                        matchedComics = matches.comics,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -484,18 +578,20 @@ private fun CategoryScreen(
 private fun CategoryContent(
     category: MediaCategory,
     result: ScanResult.Success,
+    browse: CategoryBrowseState,
     onMedia: (MediaItem) -> Unit,
     onComic: (ComicWork) -> Unit,
+    matchedComics: List<ComicWork>? = null,
 ) {
     when (category) {
         MediaCategory.Comics -> {
-            val works = remember(result.items) {
-                buildComicWorks(result.items)
+            val works = remember(result.items, matchedComics) {
+                matchedComics ?: buildComicWorks(result.items)
             }
-            ComicGrid(works, result.ignoredCount, result.skippedDirectories, onComic)
+            ComicGrid(works, result.ignoredCount, result.skippedDirectories, browse, onComic)
         }
-        MediaCategory.Video -> MediaGrid(result.items, result.ignoredCount, result.skippedDirectories, onMedia)
-        MediaCategory.Music, MediaCategory.Text -> MediaList(result.items, onMedia, result.ignoredCount, result.skippedDirectories)
+        MediaCategory.Video -> MediaGrid(result.items, result.ignoredCount, result.skippedDirectories, browse, onMedia)
+        MediaCategory.Music, MediaCategory.Text -> MediaList(result.items, onMedia, result.ignoredCount, result.skippedDirectories, browse)
     }
 }
 
@@ -525,33 +621,32 @@ private fun EmptyState(
 }
 
 @Composable
-private fun MediaList(items: List<MediaItem>, onMedia: (MediaItem) -> Unit, ignored: Int, skipped: Int) {
-    var limit by remember(items) { mutableIntStateOf(minOf(60, items.size)) }
+private fun MediaList(items: List<MediaItem>, onMedia: (MediaItem) -> Unit, ignored: Int, skipped: Int, browse: CategoryBrowseState) {
     val groups = remember(items) { orderedMediaGroups(items) }
-    val expandedGroups = remember(items) {
-        mutableStateMapOf<String, Boolean>().apply {
-            groups.forEach { (name, _) -> this[name] = true }
-        }
+    val browseGroups = remember(groups) {
+        groups.map { (name, media) -> BrowseGroup("media-group:$name", media.map { it.uri.toString() }) }
     }
+    browse.prepare(browseGroups, ignored > 0 || skipped > 0)
+    val limit = browse.limit
     val expandedItemCount = groups.sumOf { (name, groupItems) ->
-        if (expandedGroups[name] != false) groupItems.size else 0
+        if (browse.isExpanded("media-group:$name")) groupItems.size else 0
     }
     var remainingItems = limit
-    LazyColumn(contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-        if (ignored > 0 || skipped > 0) item {
+    LazyColumn(state = browse.listState(), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        if (ignored > 0 || skipped > 0) item(key = "scan-summary") {
             ScanSummary(ignored, skipped)
         }
         groups.forEach { (group, groupItems) ->
-            item(key = "media-group-$group") {
+            item(key = "media-group:$group") {
                 DirectoryGroupHeader(
                     name = group,
                     count = groupItems.size,
-                    expanded = expandedGroups[group] != false,
-                    onToggle = { expandedGroups[group] = expandedGroups[group] == false },
+                    expanded = browse.isExpanded("media-group:$group"),
+                    onToggle = { browse.toggle("media-group:$group") },
                 )
             }
 
-            if (expandedGroups[group] != false && remainingItems > 0) {
+            if (browse.isExpanded("media-group:$group") && remainingItems > 0) {
                 val visibleItems = groupItems.take(remainingItems)
                 remainingItems -= visibleItems.size
                 items(visibleItems, key = { it.uri.toString() }) { item ->
@@ -588,50 +683,50 @@ private fun MediaList(items: List<MediaItem>, onMedia: (MediaItem) -> Unit, igno
                 }
             }
         }
-        if (limit < expandedItemCount) item {
-            LaunchedEffect(limit, expandedItemCount) { limit = minOf(expandedItemCount, limit + 60) }
+        if (limit < expandedItemCount) item(key = "load-more") {
+            LaunchedEffect(limit, expandedItemCount) { browse.loadMore(expandedItemCount) }
             Box(Modifier.fillMaxWidth().padding(12.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(Modifier.size(24.dp)) }
         }
     }
 }
 
 @Composable
-private fun MediaGrid(items: List<MediaItem>, ignored: Int, skipped: Int, onMedia: (MediaItem) -> Unit) {
-    var limit by remember(items) { mutableIntStateOf(minOf(60, items.size)) }
+private fun MediaGrid(items: List<MediaItem>, ignored: Int, skipped: Int, browse: CategoryBrowseState, onMedia: (MediaItem) -> Unit) {
     val groups = remember(items) { orderedMediaGroups(items) }
-    val expandedGroups = remember(items) {
-        mutableStateMapOf<String, Boolean>().apply {
-            groups.forEach { (name, _) -> this[name] = true }
-        }
+    val browseGroups = remember(groups) {
+        groups.map { (name, media) -> BrowseGroup("media-group:$name", media.map { it.uri.toString() }) }
     }
+    browse.prepare(browseGroups, ignored > 0 || skipped > 0)
+    val limit = browse.limit
     val expandedItemCount = groups.sumOf { (name, groupItems) ->
-        if (expandedGroups[name] != false) groupItems.size else 0
+        if (browse.isExpanded("media-group:$name")) groupItems.size else 0
     }
     var remainingItems = limit
     LazyVerticalGrid(
+        state = browse.gridState(),
         columns = GridCells.Fixed(2),
         contentPadding = PaddingValues(10.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalArrangement = Arrangement.spacedBy(9.dp),
     ) {
-        if (ignored > 0 || skipped > 0) item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
+        if (ignored > 0 || skipped > 0) item(key = "scan-summary", span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
             ScanSummary(ignored, skipped)
         }
 
         groups.forEach { (groupName, groupItems) ->
             item(
-                key = "video-group-$groupName",
+                key = "media-group:$groupName",
                 span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) },
             ) {
                 DirectoryGroupHeader(
                     name = groupName,
                     count = groupItems.size,
-                    expanded = expandedGroups[groupName] != false,
-                    onToggle = { expandedGroups[groupName] = expandedGroups[groupName] == false },
+                    expanded = browse.isExpanded("media-group:$groupName"),
+                    onToggle = { browse.toggle("media-group:$groupName") },
                 )
             }
 
-            if (expandedGroups[groupName] != false && remainingItems > 0) {
+            if (browse.isExpanded("media-group:$groupName") && remainingItems > 0) {
                 val visibleItems = groupItems.take(remainingItems)
                 remainingItems -= visibleItems.size
                 items(visibleItems, key = { it.uri.toString() }) { item ->
@@ -651,8 +746,8 @@ private fun MediaGrid(items: List<MediaItem>, ignored: Int, skipped: Int, onMedi
             }
         }
 
-        if (limit < expandedItemCount) item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
-            LaunchedEffect(limit, expandedItemCount) { limit = minOf(expandedItemCount, limit + 60) }
+        if (limit < expandedItemCount) item(key = "load-more", span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
+            LaunchedEffect(limit, expandedItemCount) { browse.loadMore(expandedItemCount) }
             Box(Modifier.fillMaxWidth().padding(12.dp), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(Modifier.size(24.dp))
             }
@@ -706,23 +801,27 @@ private fun DirectoryGroupHeader(
 }
 
 @Composable
-private fun ComicGrid(works: List<ComicWork>, ignored: Int, skipped: Int, onComic: (ComicWork) -> Unit) {
-    var limit by remember(works) { mutableIntStateOf(minOf(60, works.size)) }
+private fun ComicGrid(works: List<ComicWork>, ignored: Int, skipped: Int, browse: CategoryBrowseState, onComic: (ComicWork) -> Unit) {
     val groups = remember(works) { groupComicWorks(works) }
-    val expandedGroups = remember(works) { mutableStateMapOf<String, Boolean>() }
-    val expandedWorkCount = groups.sumOf { if (expandedGroups[it.relativePath] != false) it.works.size else 0 }
+    val browseGroups = remember(groups) {
+        groups.map { group -> BrowseGroup("comic-group:${group.relativePath}", group.works.map { "comic-work:${it.relativePath}" }) }
+    }
+    browse.prepare(browseGroups, ignored > 0 || skipped > 0)
+    val limit = browse.limit
+    val expandedWorkCount = groups.sumOf { if (browse.isExpanded("comic-group:${it.relativePath}")) it.works.size else 0 }
     LazyVerticalGrid(
+        state = browse.gridState(),
         columns = GridCells.Adaptive(170.dp),
         contentPadding = PaddingValues(12.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        if (ignored > 0 || skipped > 0) item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
+        if (ignored > 0 || skipped > 0) item(key = "scan-summary", span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
             ScanSummary(ignored, skipped)
         }
         var remainingWorks = limit
         groups.forEach { group ->
-            val expanded = expandedGroups[group.relativePath] != false
+            val expanded = browse.isExpanded("comic-group:${group.relativePath}")
             item(
                 key = "comic-group:${group.relativePath}",
                 span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) },
@@ -731,7 +830,7 @@ private fun ComicGrid(works: List<ComicWork>, ignored: Int, skipped: Int, onComi
                     name = group.name,
                     count = group.works.size,
                     expanded = expanded,
-                    onToggle = { expandedGroups[group.relativePath] = !expanded },
+                    onToggle = { browse.toggle("comic-group:${group.relativePath}") },
                 )
             }
             if (expanded && remainingWorks > 0) {
@@ -754,10 +853,10 @@ private fun ComicGrid(works: List<ComicWork>, ignored: Int, skipped: Int, onComi
             }
         }
         if (limit < expandedWorkCount) item(
-            key = "comic-load-more",
+            key = "load-more",
             span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) },
         ) {
-            LaunchedEffect(limit, expandedWorkCount) { limit = minOf(expandedWorkCount, limit + 60) }
+            LaunchedEffect(limit, expandedWorkCount) { browse.loadMore(expandedWorkCount) }
             Box(Modifier.fillMaxWidth().padding(12.dp), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(Modifier.size(24.dp))
             }
@@ -836,10 +935,10 @@ private fun formatVideoDuration(durationMs: Long): String {
 }
 
 @Composable
-private fun MiniPlayer(model: ViewerViewModel) {
+private fun MiniPlayer(model: ViewerViewModel, onOpen: () -> Unit) {
     val snapshot by model.playback.collectAsStateWithLifecycle()
     Surface(
-        modifier = Modifier.fillMaxWidth().clickable { model.navigate(ViewerScreen.Player) },
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
         tonalElevation = 5.dp,
         shadowElevation = 5.dp,
     ) {
